@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: mememot-duel-server
+    env: node
+    plan: free
+    autoDeploy: true
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: CORS_ORIGIN
+        value: https://glyphcode.netlify.app,http://localhost
+      - key: RECONNECT_GRACE_MS
+        value: 90000
