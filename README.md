@@ -185,5 +185,3 @@ APK genere :
 - `server/index.js` : serveur Socket.IO / Express
 - `render.yaml` / `railway.json` : deploiement serveur cloud
 - `capacitor.config.ts` + dossier `android/` : build Android
-
-
