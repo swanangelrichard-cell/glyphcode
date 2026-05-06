@@ -8,6 +8,7 @@ import {
 import WordGridInput from "./WordGridInput";
 
 const STATS_STORAGE_KEY = "mememot_stats_v1";
+const EXACT_HINTS_STORAGE_KEY = "mememot_show_exact_hints_v1";
 
 type GameState = "playing" | "won" | "lost";
 type BannerTone = "info" | "success" | "warn";
@@ -127,6 +128,13 @@ const readStatsFromStorage = (): PlayerStats => {
   }
 };
 
+const readShowExactHintsFromStorage = () => {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return window.localStorage.getItem(EXACT_HINTS_STORAGE_KEY) === "true";
+};
+
 function SoloGame() {
   const [difficulty, setDifficulty] = useState<Difficulty>("normal");
   const [secretWord, setSecretWord] = useState<string>(() =>
@@ -134,7 +142,7 @@ function SoloGame() {
   );
   const [currentGuess, setCurrentGuess] = useState("");
   const [attempts, setAttempts] = useState<Attempt[]>([]);
-  const [showExactHints, setShowExactHints] = useState(false);
+  const [showExactHints, setShowExactHints] = useState(() => readShowExactHintsFromStorage());
   const [stats, setStats] = useState<PlayerStats>(() => readStatsFromStorage());
   const [gameState, setGameState] = useState<GameState>("playing");
   const [statusMessage, setStatusMessage] = useState(
@@ -159,6 +167,13 @@ function SoloGame() {
     }
     window.localStorage.setItem(STATS_STORAGE_KEY, JSON.stringify(stats));
   }, [stats]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(EXACT_HINTS_STORAGE_KEY, showExactHints ? "true" : "false");
+  }, [showExactHints]);
 
   useEffect(() => {
     if (recentValidatedRow === null) {

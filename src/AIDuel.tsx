@@ -15,12 +15,21 @@ type DuelGuess = {
   guess: string;
   exactCount: number;
   wordLength: number;
+  matchMask: boolean[];
 };
 
 const VALID_GUESS_SETS: Record<SupportedWordLength, ReadonlySet<string>> = {
   5: new Set(VALID_WORDS_BY_LENGTH[5]),
   6: new Set(VALID_WORDS_BY_LENGTH[6]),
   7: new Set(VALID_WORDS_BY_LENGTH[7]),
+};
+const EXACT_HINTS_STORAGE_KEY = "mememot_show_exact_hints_v1";
+
+const loadShowExactHints = () => {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return window.localStorage.getItem(EXACT_HINTS_STORAGE_KEY) === "true";
 };
 
 const sanitizeWord = (rawWord: string, maxLength: number) =>
@@ -34,14 +43,12 @@ const sanitizeWord = (rawWord: string, maxLength: number) =>
 const toTiles = (value: string, wordLength: number) =>
   Array.from({ length: wordLength }, (_, index) => value[index] ?? "");
 
+const buildMatchMask = (firstWord: string, secondWord: string, wordLength: number) =>
+  Array.from({ length: wordLength }, (_, index) => firstWord[index] === secondWord[index]);
+
 const countExactMatches = (firstWord: string, secondWord: string, wordLength: number) => {
-  let exactCount = 0;
-  for (let index = 0; index < wordLength; index += 1) {
-    if (firstWord[index] === secondWord[index]) {
-      exactCount += 1;
-    }
-  }
-  return exactCount;
+  const matchMask = buildMatchMask(firstWord, secondWord, wordLength);
+  return matchMask.filter(Boolean).length;
 };
 
 const pickSecretWord = (wordLength: SupportedWordLength) => {
@@ -90,9 +97,17 @@ function AIDuel() {
   const [aiGuesses, setAiGuesses] = useState<DuelGuess[]>([]);
   const [aiCandidates, setAiCandidates] = useState<string[]>([]);
   const [aiThinking, setAiThinking] = useState(false);
+  const [showExactHints, setShowExactHints] = useState(() => loadShowExactHints());
 
   const validWordSet = useMemo(() => VALID_GUESS_SETS[selectedWordLength], [selectedWordLength]);
   const rowTilesStyle = { ["--letters" as string]: selectedWordLength } as CSSProperties;
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(EXACT_HINTS_STORAGE_KEY, showExactHints ? "true" : "false");
+  }, [showExactHints]);
 
   useEffect(() => {
     if (phase !== "playing" || turn !== "ai" || playerSecret.length !== selectedWordLength) {
@@ -111,11 +126,13 @@ function AIDuel() {
         return;
       }
 
-      const exactCount = countExactMatches(aiGuess, playerSecret, selectedWordLength);
+      const matchMask = buildMatchMask(aiGuess, playerSecret, selectedWordLength);
+      const exactCount = matchMask.filter(Boolean).length;
       const nextGuess: DuelGuess = {
         guess: aiGuess,
         exactCount,
         wordLength: selectedWordLength,
+        matchMask,
       };
       const nextCandidates = aiCandidates.filter(
         (candidateWord) =>
@@ -201,11 +218,13 @@ function AIDuel() {
       return;
     }
 
-    const exactCount = countExactMatches(sanitizedGuess, aiSecret, selectedWordLength);
+    const matchMask = buildMatchMask(sanitizedGuess, aiSecret, selectedWordLength);
+    const exactCount = matchMask.filter(Boolean).length;
     const nextGuess: DuelGuess = {
       guess: sanitizedGuess,
       exactCount,
       wordLength: selectedWordLength,
+      matchMask,
     };
 
     setPlayerGuesses((previousGuesses) => [...previousGuesses, nextGuess]);
@@ -265,6 +284,15 @@ function AIDuel() {
             Longueur: <strong>{selectedWordLength}</strong> lettres | Tour:{" "}
             <strong>{phase === "playing" ? (turn === "player" ? "toi" : "IA") : "-"}</strong>
           </p>
+
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={showExactHints}
+              onChange={(event) => setShowExactHints(event.target.checked)}
+            />
+            <span>Afficher les positions exactes (cases vertes)</span>
+          </label>
 
           {phase === "setup" && (
             <form className="duel-form" onSubmit={onStartDuelSubmit}>
@@ -332,7 +360,16 @@ function AIDuel() {
                 <div className="row row--past" key={`${guess.guess}-${rowIndex}`}>
                   <div className="row__tiles" style={rowTilesStyle}>
                     {toTiles(guess.guess, selectedWordLength).map((letter, index) => (
-                      <div className="tile tile--masked" key={`${rowIndex}-${index}`}>
+                      <div
+                        className={`tile ${
+                          showExactHints
+                            ? guess.matchMask[index]
+                              ? "tile--exact"
+                              : "tile--off"
+                            : "tile--masked"
+                        }`}
+                        key={`${rowIndex}-${index}`}
+                      >
                         {letter}
                       </div>
                     ))}

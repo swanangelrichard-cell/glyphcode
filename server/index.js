@@ -11,6 +11,7 @@ const PORT = Number(process.env.PORT ?? 3001);
 const RECONNECT_GRACE_MS = Number(process.env.RECONNECT_GRACE_MS ?? 90_000);
 const VALID_WORD_LENGTHS = new Set([5, 6, 7]);
 const DEFAULT_MAX_ATTEMPTS_PER_PLAYER = 8;
+const INFINITE_MAX_ATTEMPTS_PER_PLAYER = 0;
 const MIN_MAX_ATTEMPTS_PER_PLAYER = 4;
 const MAX_MAX_ATTEMPTS_PER_PLAYER = 12;
 const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -96,11 +97,16 @@ const sanitizeMaxAttempts = (value) => {
   if (!Number.isInteger(parsed)) {
     return DEFAULT_MAX_ATTEMPTS_PER_PLAYER;
   }
+  if (parsed === INFINITE_MAX_ATTEMPTS_PER_PLAYER) {
+    return INFINITE_MAX_ATTEMPTS_PER_PLAYER;
+  }
   return Math.max(
     MIN_MAX_ATTEMPTS_PER_PLAYER,
     Math.min(MAX_MAX_ATTEMPTS_PER_PLAYER, parsed),
   );
 };
+
+const isInfiniteAttempts = (value) => value === INFINITE_MAX_ATTEMPTS_PER_PLAYER;
 
 const sanitizeWord = (value, expectedLength) =>
   (typeof value === "string" ? value : "")
@@ -690,7 +696,9 @@ io.on("connection", (socket) => {
       return;
     }
 
-    if (player.guessesCount >= room.maxAttemptsPerPlayer) {
+    const hasFiniteAttempts = !isInfiniteAttempts(room.maxAttemptsPerPlayer);
+
+    if (hasFiniteAttempts && player.guessesCount >= room.maxAttemptsPerPlayer) {
       safeAck(ack, {
         ok: false,
         message: "Tu n'as plus d'essais disponibles.",
@@ -739,35 +747,38 @@ io.on("connection", (socket) => {
       return;
     }
 
-    let exactCount = 0;
-    for (let index = 0; index < room.wordLength; index += 1) {
-      if (guess[index] === opponentSecret[index]) {
-        exactCount += 1;
-      }
-    }
+    const matchMask = Array.from(
+      { length: room.wordLength },
+      (_, index) => guess[index] === opponentSecret[index],
+    );
+    const exactCount = matchMask.filter(Boolean).length;
 
     player.lastGuessAt = now;
     room.guessesByPlayer[player.id].push({
       guess,
       exactCount,
       wordLength: room.wordLength,
+      matchMask,
       createdAt: new Date().toISOString(),
     });
     player.guessesCount += 1;
     room.rematchRequestsByPlayer[player.id] = false;
 
     const opponent = room.players[opponentId];
-    const playerAttemptsLeft = room.maxAttemptsPerPlayer - player.guessesCount;
-    const opponentAttemptsLeft = Math.max(
-      0,
-      room.maxAttemptsPerPlayer - (opponent?.guessesCount ?? 0),
-    );
+    const playerAttemptsLeft = hasFiniteAttempts
+      ? Math.max(0, room.maxAttemptsPerPlayer - player.guessesCount)
+      : null;
+    const opponentAttemptsLeft = hasFiniteAttempts
+      ? Math.max(0, room.maxAttemptsPerPlayer - (opponent?.guessesCount ?? 0))
+      : null;
 
     if (guess === opponentSecret) {
       room.phase = "finished";
       room.winnerId = player.id;
       room.turnPlayerId = null;
       pushSystemMessage(room, `${player.name} a trouve le mot adverse et gagne.`);
+    } else if (!hasFiniteAttempts) {
+      room.turnPlayerId = opponentId;
     } else {
       const playerNoMoreAttempts = playerAttemptsLeft <= 0;
       const opponentNoMoreAttempts = opponentAttemptsLeft <= 0;
@@ -795,8 +806,9 @@ io.on("connection", (socket) => {
     safeAck(ack, {
       ok: true,
       exactCount,
+      matchMask,
       wordLength: room.wordLength,
-      remainingAttempts: Math.max(0, playerAttemptsLeft),
+      remainingAttempts: hasFiniteAttempts ? playerAttemptsLeft : null,
       maxAttemptsPerPlayer: room.maxAttemptsPerPlayer,
     });
   });

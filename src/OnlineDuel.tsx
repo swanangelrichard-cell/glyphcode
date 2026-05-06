@@ -18,6 +18,7 @@ type DuelGuess = {
   guess: string;
   exactCount: number;
   wordLength: number;
+  matchMask?: boolean[];
   createdAt?: string;
 };
 
@@ -55,7 +56,8 @@ type AckResponse =
       maxAttemptsPerPlayer?: number;
       hasPassword?: boolean;
       exactCount?: number;
-      remainingAttempts?: number;
+      matchMask?: boolean[];
+      remainingAttempts?: number | null;
       resumed?: boolean;
       started?: boolean;
       message?: string;
@@ -71,15 +73,29 @@ type DuelSession = {
 const ENV_DUEL_SERVER_URL = (import.meta.env.VITE_DUEL_SERVER_URL as string | undefined)?.trim();
 const DEFAULT_DEV_DUEL_SERVER_URL = "http://localhost:3001";
 const DEFAULT_PROD_DUEL_SERVER_URL = "https://mememot-duel-server.onrender.com";
-const DUEL_SERVER_URL =
-  ENV_DUEL_SERVER_URL && ENV_DUEL_SERVER_URL.length > 0
-    ? ENV_DUEL_SERVER_URL
-    : import.meta.env.DEV
-      ? DEFAULT_DEV_DUEL_SERVER_URL
-      : DEFAULT_PROD_DUEL_SERVER_URL;
+
+const isLocalhostServerUrl = (url: string) =>
+  /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(url);
+
+const DUEL_SERVER_URL = (() => {
+  const envUrl = ENV_DUEL_SERVER_URL && ENV_DUEL_SERVER_URL.length > 0 ? ENV_DUEL_SERVER_URL : null;
+  const allowLocalhost = import.meta.env.DEV;
+
+  if (envUrl && (allowLocalhost || !isLocalhostServerUrl(envUrl))) {
+    return envUrl;
+  }
+
+  if (allowLocalhost) {
+    return DEFAULT_DEV_DUEL_SERVER_URL;
+  }
+
+  return DEFAULT_PROD_DUEL_SERVER_URL;
+})();
 const DUEL_SESSION_STORAGE_KEY = "mememot_duel_session_v1";
 const DUEL_NAME_STORAGE_KEY = "mememot_duel_name_v1";
+const DUEL_SHOW_EXACT_HINTS_STORAGE_KEY = "mememot_show_exact_hints_v1";
 const QUICK_CHAT_MESSAGES = ["Bonne chance", "Bien joue", "A toi", "GG"];
+const INFINITE_ATTEMPTS_VALUE = 0;
 const MIN_MAX_ATTEMPTS_PER_PLAYER = 4;
 const MAX_MAX_ATTEMPTS_PER_PLAYER = 12;
 
@@ -105,6 +121,11 @@ const sanitizeRoomPassword = (value: string) =>
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, "")
     .slice(0, 12);
+
+const isInfiniteAttempts = (attemptCount: number) => attemptCount === INFINITE_ATTEMPTS_VALUE;
+
+const formatAttemptsLimit = (attemptCount: number) =>
+  isInfiniteAttempts(attemptCount) ? "Infini" : String(attemptCount);
 
 const createDefaultName = () => `Joueur-${Math.floor(100 + Math.random() * 900)}`;
 
@@ -149,6 +170,14 @@ const loadStoredName = () => {
   return trimmed.length > 0 ? trimmed.slice(0, 24) : null;
 };
 
+const loadStoredShowExactHints = () => {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  const rawValue = localStorage.getItem(DUEL_SHOW_EXACT_HINTS_STORAGE_KEY);
+  return rawValue === "true";
+};
+
 const formatClock = (isoDate: string) => {
   const date = new Date(isoDate);
   if (Number.isNaN(date.valueOf())) {
@@ -179,6 +208,7 @@ function OnlineDuel() {
     "Connecte-toi a un salon pour commencer le duel.",
   );
   const [statusTone, setStatusTone] = useState<"info" | "warn" | "success">("info");
+  const [showExactHints, setShowExactHints] = useState(() => loadStoredShowExactHints());
   const chatLogRef = useRef<HTMLDivElement | null>(null);
   const myGuessInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -194,6 +224,13 @@ function OnlineDuel() {
       localStorage.setItem(DUEL_NAME_STORAGE_KEY, trimmed.slice(0, 24));
     }
   }, [displayName]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    localStorage.setItem(DUEL_SHOW_EXACT_HINTS_STORAGE_KEY, showExactHints ? "true" : "false");
+  }, [showExactHints]);
 
   useEffect(() => {
     const nextSocket = io(DUEL_SERVER_URL, {
@@ -326,7 +363,9 @@ function OnlineDuel() {
     ? Math.round(duelState.reconnectGraceMs / 1000)
     : 90;
   const maxAttemptsPerPlayer = duelState?.maxAttemptsPerPlayer ?? selectedMaxAttempts;
-  const myRemainingAttempts = Math.max(0, maxAttemptsPerPlayer - myGuesses.length);
+  const myRemainingAttempts = isInfiniteAttempts(maxAttemptsPerPlayer)
+    ? null
+    : Math.max(0, maxAttemptsPerPlayer - myGuesses.length);
   const myRematchRequested =
     Boolean(myPlayerId && duelState?.rematchRequestsByPlayer?.[myPlayerId]);
   const opponentRematchRequested = Boolean(
@@ -515,10 +554,13 @@ function OnlineDuel() {
 
       setGuessInput("");
       if (typeof response.exactCount === "number") {
+        const attemptsLimit = response.maxAttemptsPerPlayer ?? duelState.maxAttemptsPerPlayer;
         const remainingText =
           typeof response.remainingAttempts === "number"
-            ? ` | Essais restants: ${response.remainingAttempts}/${response.maxAttemptsPerPlayer ?? duelState.maxAttemptsPerPlayer}`
-            : "";
+            ? ` | Essais restants: ${response.remainingAttempts}/${formatAttemptsLimit(attemptsLimit)}`
+            : isInfiniteAttempts(attemptsLimit)
+              ? " | Essais restants: infinis"
+              : "";
         setStatusMessage(
           `Essai envoye: ${response.exactCount}/${duelState.wordLength} bien placees.${remainingText}`,
         );
@@ -714,18 +756,26 @@ function OnlineDuel() {
                 <select
                   className="duel-select"
                   value={selectedMaxAttempts}
-                  onChange={(event) =>
+                  onChange={(event) => {
+                    const parsed = Number(event.target.value);
+                    if (parsed === INFINITE_ATTEMPTS_VALUE) {
+                      setSelectedMaxAttempts(INFINITE_ATTEMPTS_VALUE);
+                      return;
+                    }
                     setSelectedMaxAttempts(
                       Math.max(
                         MIN_MAX_ATTEMPTS_PER_PLAYER,
                         Math.min(
                           MAX_MAX_ATTEMPTS_PER_PLAYER,
-                          Number(event.target.value) || MIN_MAX_ATTEMPTS_PER_PLAYER,
+                          parsed || MIN_MAX_ATTEMPTS_PER_PLAYER,
                         ),
                       ),
-                    )
-                  }
+                    );
+                  }}
                 >
+                  <option value={INFINITE_ATTEMPTS_VALUE}>
+                    Essais infinis (jusqu'a victoire)
+                  </option>
                   {Array.from(
                     {
                       length:
@@ -813,7 +863,7 @@ function OnlineDuel() {
               <p className="duel-meta">
                 Phase: <strong>{duelState.phase}</strong> | Mot de{" "}
                 <strong>{duelState.wordLength}</strong> lettres | Essais max:{" "}
-                <strong>{duelState.maxAttemptsPerPlayer}</strong> / joueur
+                <strong>{formatAttemptsLimit(duelState.maxAttemptsPerPlayer)}</strong> / joueur
               </p>
               <p className="duel-meta">
                 Reconnexion auto: <strong>{reconnectSeconds}s</strong> de delai avant retrait.
@@ -830,7 +880,7 @@ function OnlineDuel() {
                     <strong>
                       {player.connected ? "En ligne" : "Hors ligne"} |{" "}
                       {player.ready ? "Pret" : "Pas pret"} | {player.guessesCount}/
-                      {duelState.maxAttemptsPerPlayer} essai(s)
+                      {formatAttemptsLimit(duelState.maxAttemptsPerPlayer)} essai(s)
                     </strong>
                   </li>
                 ))}
@@ -871,7 +921,8 @@ function OnlineDuel() {
                   </p>
                   <p className="duel-note">
                     Ecris directement dans la grille "Mes essais". Tes essais restants:{" "}
-                    <strong>{myRemainingAttempts}</strong> / {duelState.maxAttemptsPerPlayer}
+                    <strong>{myRemainingAttempts === null ? "infinis" : myRemainingAttempts}</strong>{" "}
+                    / {formatAttemptsLimit(duelState.maxAttemptsPerPlayer)}
                   </p>
                 </>
               )}
@@ -924,6 +975,14 @@ function OnlineDuel() {
               <p className="duel-meta">
                 Tu affrontes <strong>{opponentPlayer?.name ?? "..."}</strong>
               </p>
+              <label className="toggle">
+                <input
+                  type="checkbox"
+                  checked={showExactHints}
+                  onChange={(event) => setShowExactHints(event.target.checked)}
+                />
+                <span>Afficher les positions exactes (cases vertes)</span>
+              </label>
 
               <div
                 className="duel-grid-board"
@@ -952,7 +1011,16 @@ function OnlineDuel() {
                     <div className="row row--past" key={`${guess.guess}-${rowIndex}`}>
                       <div className="row__tiles" style={rowTilesStyle}>
                         {toTiles(guess.guess, duelState.wordLength).map((letter, index) => (
-                          <div className="tile tile--masked" key={`${rowIndex}-${index}`}>
+                          <div
+                            className={`tile ${
+                              showExactHints
+                                ? guess.matchMask?.[index]
+                                  ? "tile--exact"
+                                  : "tile--off"
+                                : "tile--masked"
+                            }`}
+                            key={`${rowIndex}-${index}`}
+                          >
                             {letter}
                           </div>
                         ))}
