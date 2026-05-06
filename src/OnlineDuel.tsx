@@ -68,8 +68,15 @@ type DuelSession = {
   playerToken: string;
 };
 
+const ENV_DUEL_SERVER_URL = (import.meta.env.VITE_DUEL_SERVER_URL as string | undefined)?.trim();
+const DEFAULT_DEV_DUEL_SERVER_URL = "http://localhost:3001";
+const DEFAULT_PROD_DUEL_SERVER_URL = "https://mememot-duel-server.onrender.com";
 const DUEL_SERVER_URL =
-  (import.meta.env.VITE_DUEL_SERVER_URL as string | undefined) ?? "http://localhost:3001";
+  ENV_DUEL_SERVER_URL && ENV_DUEL_SERVER_URL.length > 0
+    ? ENV_DUEL_SERVER_URL
+    : import.meta.env.DEV
+      ? DEFAULT_DEV_DUEL_SERVER_URL
+      : DEFAULT_PROD_DUEL_SERVER_URL;
 const DUEL_SESSION_STORAGE_KEY = "mememot_duel_session_v1";
 const DUEL_NAME_STORAGE_KEY = "mememot_duel_name_v1";
 const QUICK_CHAT_MESSAGES = ["Bonne chance", "Bien joue", "A toi", "GG"];
