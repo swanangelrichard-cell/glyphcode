@@ -1,10 +1,11 @@
-import { CSSProperties, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, useEffect, useMemo, useState } from "react";
 import "./App.css";
 import {
   SECRET_WORDS_BY_LENGTH,
   SupportedWordLength,
   VALID_WORDS_BY_LENGTH,
 } from "./wordBank";
+import WordGridInput from "./WordGridInput";
 
 const STATS_STORAGE_KEY = "mememot_stats_v1";
 
@@ -88,13 +89,6 @@ const pickSecretWord = (wordLength: SupportedWordLength) => {
   return pool[Math.floor(Math.random() * pool.length)];
 };
 
-const sanitizeTyping = (raw: string) =>
-  raw
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-zA-Z]/g, "")
-    .toUpperCase();
-
 const toTiles = (value: string, wordLength: number) =>
   Array.from({ length: wordLength }, (_, index) => value[index] ?? "");
 
@@ -134,7 +128,6 @@ const readStatsFromStorage = (): PlayerStats => {
 };
 
 function SoloGame() {
-  const boardInputRef = useRef<HTMLInputElement | null>(null);
   const [difficulty, setDifficulty] = useState<Difficulty>("normal");
   const [secretWord, setSecretWord] = useState<string>(() =>
     pickSecretWord(DIFFICULTY_CONFIG.normal.wordLength),
@@ -190,18 +183,6 @@ function SoloGame() {
 
     return () => window.clearTimeout(timeoutId);
   }, [isShakingInvalidGuess]);
-
-  useEffect(() => {
-    if (gameState !== "playing") {
-      return;
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      boardInputRef.current?.focus();
-    }, 20);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [gameState, attempts.length, difficulty]);
 
   const rows = useMemo<RowModel[]>(
     () =>
@@ -343,30 +324,6 @@ function SoloGame() {
     setBannerTone("info");
   };
 
-  const onBoardInputKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
-    if (gameState !== "playing" || event.altKey || event.ctrlKey || event.metaKey) {
-      return;
-    }
-
-    if (event.key === "Enter") {
-      event.preventDefault();
-      submitGuess();
-      return;
-    }
-
-    if (event.key === "Escape") {
-      event.preventDefault();
-      setCurrentGuess("");
-      return;
-    }
-  };
-
-  const focusBoardInput = () => {
-    if (gameState === "playing") {
-      boardInputRef.current?.focus();
-    }
-  };
-
   const onReset = () => {
     startNewGame(
       difficulty,
@@ -396,26 +353,8 @@ function SoloGame() {
       <main className="layout">
         <section
           className={`board-card board-card--typing ${isShakingInvalidGuess ? "board-card--shake" : ""}`}
-          onMouseDown={focusBoardInput}
-          onTouchStart={focusBoardInput}
           aria-label="grille des essais"
         >
-          <input
-            ref={boardInputRef}
-            className="grid-capture-input"
-            type="text"
-            inputMode="text"
-            autoCapitalize="characters"
-            autoCorrect="off"
-            autoComplete="off"
-            spellCheck={false}
-            maxLength={wordLength}
-            value={currentGuess}
-            onChange={(event) => setCurrentGuess(sanitizeTyping(event.target.value).slice(0, wordLength))}
-            onKeyDown={onBoardInputKeyDown}
-            disabled={gameState !== "playing"}
-            aria-label="Saisie des essais"
-          />
           <div className="board-card__header">
             <h2>Grille des essais</h2>
             <span>
@@ -431,35 +370,42 @@ function SoloGame() {
                 }`}
                 key={row.id}
               >
-                <div className="row__tiles" style={rowTilesStyle}>
-                  {row.letters.map((letter, index) => {
-                    const tileStyle = {
-                      ["--tile-index" as string]: index,
-                    } as CSSProperties;
+                {row.kind === "current" ? (
+                  <div className="row__tiles row__tiles--input" style={rowTilesStyle}>
+                    <WordGridInput
+                      value={currentGuess}
+                      onChange={(nextValue) => setCurrentGuess(nextValue.slice(0, wordLength))}
+                      length={wordLength}
+                      onSubmit={submitGuess}
+                      disabled={gameState !== "playing"}
+                      autoFocus={gameState === "playing"}
+                    />
+                  </div>
+                ) : (
+                  <div className="row__tiles" style={rowTilesStyle}>
+                    {row.letters.map((letter, index) => {
+                      const tileStyle = {
+                        ["--tile-index" as string]: index,
+                      } as CSSProperties;
 
-                    const variant =
-                      row.kind === "past"
-                        ? showExactHints
-                          ? row.matchMask[index]
-                            ? "tile--exact"
-                            : "tile--off"
-                          : "tile--masked"
-                        : row.kind === "current" && letter
-                          ? "tile--typing"
+                      const variant =
+                        row.kind === "past"
+                          ? showExactHints
+                            ? row.matchMask[index]
+                              ? "tile--exact"
+                              : "tile--off"
+                            : "tile--masked"
                           : "tile--idle";
 
-                    return (
-                      <div
-                        className={`tile ${variant}`}
-                        key={`${row.id}-${index}`}
-                        style={tileStyle}
-                      >
-                        {letter}
-                      </div>
-                    );
-                  })}
-                </div>
-                <span className="row__score">{row.scoreLabel}</span>
+                      return (
+                        <div className={`tile ${variant}`} key={`${row.id}-${index}`} style={tileStyle}>
+                          {letter}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                <span className="row__score">{row.kind === "current" ? "en cours" : row.scoreLabel}</span>
               </div>
             ))}
           </div>

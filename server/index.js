@@ -1,21 +1,38 @@
 import cors from "cors";
 import express from "express";
+import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Server } from "socket.io";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const RECONNECT_GRACE_MS = Number(process.env.RECONNECT_GRACE_MS ?? 90_000);
 const VALID_WORD_LENGTHS = new Set([5, 6, 7]);
+const DEFAULT_MAX_ATTEMPTS_PER_PLAYER = 8;
+const MIN_MAX_ATTEMPTS_PER_PLAYER = 4;
+const MAX_MAX_ATTEMPTS_PER_PLAYER = 12;
 const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const MAX_CHAT_MESSAGES = 60;
 const MAX_CHAT_MESSAGE_LENGTH = 180;
+const GUESS_COOLDOWN_MS = 350;
+const CHAT_COOLDOWN_MS = 250;
 const MOBILE_APP_ORIGINS = new Set([
   "http://localhost",
   "https://localhost",
   "capacitor://localhost",
   "ionic://localhost",
 ]);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const dictionaryPath = resolve(__dirname, "../src/data/frenchWordsByLength.json");
+const rawDictionary = JSON.parse(readFileSync(dictionaryPath, "utf-8"));
+const WORD_SETS_BY_LENGTH = {
+  5: new Set(rawDictionary[5]),
+  6: new Set(rawDictionary[6]),
+  7: new Set(rawDictionary[7]),
+};
 
 const parseAllowedOrigins = (rawOrigins) => {
   if (!rawOrigins) {
@@ -67,6 +84,23 @@ const sanitizeRoomCode = (value) =>
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, "")
     .slice(0, 6);
+
+const sanitizeRoomPassword = (value) =>
+  (typeof value === "string" ? value : "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 12);
+
+const sanitizeMaxAttempts = (value) => {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed)) {
+    return DEFAULT_MAX_ATTEMPTS_PER_PLAYER;
+  }
+  return Math.max(
+    MIN_MAX_ATTEMPTS_PER_PLAYER,
+    Math.min(MAX_MAX_ATTEMPTS_PER_PLAYER, parsed),
+  );
+};
 
 const sanitizeWord = (value, expectedLength) =>
   (typeof value === "string" ? value : "")
@@ -160,19 +194,24 @@ const buildRoomState = (room) => {
   }
 
   const guessesByPlayer = {};
+  const rematchRequests = {};
   for (const playerId of room.playerOrder) {
     guessesByPlayer[playerId] = room.guessesByPlayer[playerId] ?? [];
+    rematchRequests[playerId] = room.rematchRequestsByPlayer[playerId] ?? false;
   }
 
   return {
     code: room.code,
     wordLength: room.wordLength,
+    maxAttemptsPerPlayer: room.maxAttemptsPerPlayer,
+    hasPassword: Boolean(room.accessKey),
     phase: room.phase,
     winnerId: room.winnerId,
     turnPlayerId: room.turnPlayerId,
     playerOrder: [...room.playerOrder],
     players,
     guessesByPlayer,
+    rematchRequestsByPlayer: rematchRequests,
     chat: room.chat,
     reconnectGraceMs: RECONNECT_GRACE_MS,
   };
@@ -245,7 +284,12 @@ const setWinnerFromRemainingPlayer = (room, departingPlayerName) => {
   if (room.phase === "waiting") {
     remainingPlayer.ready = false;
     remainingPlayer.hasSecret = false;
+    remainingPlayer.guessesCount = 0;
+    remainingPlayer.lastGuessAt = 0;
+    remainingPlayer.lastChatAt = 0;
     room.secretsByPlayer[remainingPlayerId] = null;
+    room.guessesByPlayer[remainingPlayerId] = [];
+    room.rematchRequestsByPlayer[remainingPlayerId] = false;
     room.turnPlayerId = null;
     room.winnerId = null;
     return;
@@ -279,6 +323,7 @@ const removePlayerFromRoom = (room, playerId) => {
   delete room.players[playerId];
   delete room.secretsByPlayer[playerId];
   delete room.guessesByPlayer[playerId];
+  delete room.rematchRequestsByPlayer[playerId];
   room.playerOrder = room.playerOrder.filter((id) => id !== playerId);
   playerSessionsByToken.delete(player.token);
 
@@ -287,6 +332,27 @@ const removePlayerFromRoom = (room, playerId) => {
 
   if (rooms.has(room.code)) {
     emitRoomState(room);
+  }
+};
+
+const resetRoomForChoosing = (room) => {
+  room.phase = "choosing";
+  room.winnerId = null;
+  room.turnPlayerId = null;
+
+  for (const playerId of room.playerOrder) {
+    const player = room.players[playerId];
+    if (!player) {
+      continue;
+    }
+
+    player.ready = false;
+    player.hasSecret = false;
+    player.guessesCount = 0;
+    player.lastGuessAt = 0;
+    room.secretsByPlayer[playerId] = null;
+    room.guessesByPlayer[playerId] = [];
+    room.rematchRequestsByPlayer[playerId] = false;
   }
 };
 
@@ -300,9 +366,15 @@ const maybeStartPlaying = (room) => {
     return;
   }
 
+  const starterIndex = Math.max(
+    0,
+    Math.min(room.playerOrder.length - 1, Number(room.nextStarterIndex ?? 0)),
+  );
+
   room.phase = "playing";
   room.winnerId = null;
-  room.turnPlayerId = room.playerOrder[0];
+  room.turnPlayerId = room.playerOrder[starterIndex];
+  room.nextStarterIndex = (starterIndex + 1) % room.playerOrder.length;
 };
 
 const getRoomAndPlayerFromSocket = (socket) => {
@@ -366,14 +438,27 @@ io.on("connection", (socket) => {
 
     const requestedLength = Number(payload?.wordLength);
     const wordLength = VALID_WORD_LENGTHS.has(requestedLength) ? requestedLength : 5;
+    const maxAttemptsPerPlayer = sanitizeMaxAttempts(payload?.maxAttemptsPerPlayer);
+    const accessKey = sanitizeRoomPassword(payload?.roomPassword);
+    if (typeof payload?.roomPassword === "string" && payload.roomPassword.trim().length > 0 && accessKey.length < 4) {
+      safeAck(ack, {
+        ok: false,
+        message: "Le mot de passe doit contenir au moins 4 caracteres alphanumeriques.",
+      });
+      return;
+    }
     const roomCode = createRoomCode(rooms);
     const playerName = sanitizeName(payload?.playerName);
     const playerId = randomUUID();
     const playerToken = randomUUID();
+    const starterIndex = Math.floor(Math.random() * 2);
 
     const room = {
       code: roomCode,
       wordLength,
+      maxAttemptsPerPlayer,
+      accessKey: accessKey.length >= 4 ? accessKey : "",
+      nextStarterIndex: starterIndex,
       phase: "waiting",
       winnerId: null,
       turnPlayerId: null,
@@ -387,6 +472,8 @@ io.on("connection", (socket) => {
           ready: false,
           hasSecret: false,
           guessesCount: 0,
+          lastGuessAt: 0,
+          lastChatAt: 0,
           socketId: socket.id,
           disconnectTimer: null,
         },
@@ -397,6 +484,9 @@ io.on("connection", (socket) => {
       guessesByPlayer: {
         [playerId]: [],
       },
+      rematchRequestsByPlayer: {
+        [playerId]: false,
+      },
       chat: [],
     };
 
@@ -406,7 +496,15 @@ io.on("connection", (socket) => {
     pushSystemMessage(room, `${playerName} a cree la salle.`);
     emitRoomState(room);
 
-    safeAck(ack, { ok: true, roomCode, playerId, playerToken, wordLength });
+    safeAck(ack, {
+      ok: true,
+      roomCode,
+      playerId,
+      playerToken,
+      wordLength,
+      maxAttemptsPerPlayer,
+      hasPassword: Boolean(room.accessKey),
+    });
   });
 
   socket.on("duel:join-room", (payload, ack) => {
@@ -432,6 +530,12 @@ io.on("connection", (socket) => {
       return;
     }
 
+    const providedRoomPassword = sanitizeRoomPassword(payload?.roomPassword);
+    if (room.accessKey && providedRoomPassword !== room.accessKey) {
+      safeAck(ack, { ok: false, message: "Mot de passe de salle invalide." });
+      return;
+    }
+
     const playerName = sanitizeName(payload?.playerName);
     const playerId = randomUUID();
     const playerToken = randomUUID();
@@ -444,12 +548,15 @@ io.on("connection", (socket) => {
       ready: false,
       hasSecret: false,
       guessesCount: 0,
+      lastGuessAt: 0,
+      lastChatAt: 0,
       socketId: socket.id,
       disconnectTimer: null,
     };
     room.playerOrder.push(playerId);
     room.secretsByPlayer[playerId] = null;
     room.guessesByPlayer[playerId] = [];
+    room.rematchRequestsByPlayer[playerId] = false;
     room.phase = "choosing";
     room.winnerId = null;
     room.turnPlayerId = null;
@@ -465,6 +572,8 @@ io.on("connection", (socket) => {
       playerId,
       playerToken,
       wordLength: room.wordLength,
+      maxAttemptsPerPlayer: room.maxAttemptsPerPlayer,
+      hasPassword: Boolean(room.accessKey),
     });
   });
 
@@ -505,6 +614,8 @@ io.on("connection", (socket) => {
       playerId: player.id,
       playerToken: player.token,
       wordLength: room.wordLength,
+      maxAttemptsPerPlayer: room.maxAttemptsPerPlayer,
+      hasPassword: Boolean(room.accessKey),
       resumed: true,
     });
   });
@@ -537,6 +648,15 @@ io.on("connection", (socket) => {
       return;
     }
 
+    const validWordSet = WORD_SETS_BY_LENGTH[room.wordLength];
+    if (!validWordSet?.has(sanitizedWord)) {
+      safeAck(ack, {
+        ok: false,
+        message: "Mot secret invalide pour le dictionnaire.",
+      });
+      return;
+    }
+
     room.secretsByPlayer[player.id] = sanitizedWord;
     player.ready = true;
     player.hasSecret = true;
@@ -564,11 +684,45 @@ io.on("connection", (socket) => {
       return;
     }
 
+    const now = Date.now();
+    if (now - player.lastGuessAt < GUESS_COOLDOWN_MS) {
+      safeAck(ack, { ok: false, message: "Action trop rapide. Reessaie dans un instant." });
+      return;
+    }
+
+    if (player.guessesCount >= room.maxAttemptsPerPlayer) {
+      safeAck(ack, {
+        ok: false,
+        message: "Tu n'as plus d'essais disponibles.",
+      });
+      return;
+    }
+
     const guess = sanitizeWord(payload?.guess, room.wordLength);
     if (guess.length !== room.wordLength) {
       safeAck(ack, {
         ok: false,
         message: `Ton essai doit contenir ${room.wordLength} lettres.`,
+      });
+      return;
+    }
+
+    const validWordSet = WORD_SETS_BY_LENGTH[room.wordLength];
+    if (!validWordSet?.has(guess)) {
+      safeAck(ack, {
+        ok: false,
+        message: "Mot invalide pour le dictionnaire.",
+      });
+      return;
+    }
+
+    const alreadyGuessed = (room.guessesByPlayer[player.id] ?? []).some(
+      (entry) => entry.guess === guess,
+    );
+    if (alreadyGuessed) {
+      safeAck(ack, {
+        ok: false,
+        message: "Mot deja propose dans cette manche.",
       });
       return;
     }
@@ -592,6 +746,7 @@ io.on("connection", (socket) => {
       }
     }
 
+    player.lastGuessAt = now;
     room.guessesByPlayer[player.id].push({
       guess,
       exactCount,
@@ -599,6 +754,14 @@ io.on("connection", (socket) => {
       createdAt: new Date().toISOString(),
     });
     player.guessesCount += 1;
+    room.rematchRequestsByPlayer[player.id] = false;
+
+    const opponent = room.players[opponentId];
+    const playerAttemptsLeft = room.maxAttemptsPerPlayer - player.guessesCount;
+    const opponentAttemptsLeft = Math.max(
+      0,
+      room.maxAttemptsPerPlayer - (opponent?.guessesCount ?? 0),
+    );
 
     if (guess === opponentSecret) {
       room.phase = "finished";
@@ -606,11 +769,36 @@ io.on("connection", (socket) => {
       room.turnPlayerId = null;
       pushSystemMessage(room, `${player.name} a trouve le mot adverse et gagne.`);
     } else {
-      room.turnPlayerId = opponentId;
+      const playerNoMoreAttempts = playerAttemptsLeft <= 0;
+      const opponentNoMoreAttempts = opponentAttemptsLeft <= 0;
+
+      if (playerNoMoreAttempts && opponentNoMoreAttempts) {
+        room.phase = "finished";
+        room.winnerId = null;
+        room.turnPlayerId = null;
+        pushSystemMessage(room, "Egalite: plus aucun essai disponible pour les deux joueurs.");
+      } else if (playerNoMoreAttempts) {
+        room.turnPlayerId = opponentId;
+        pushSystemMessage(room, `${player.name} n'a plus d'essais.`);
+      } else if (opponentNoMoreAttempts) {
+        room.turnPlayerId = player.id;
+        pushSystemMessage(
+          room,
+          `${opponent?.name ?? "Adversaire"} n'a plus d'essais. ${player.name} rejoue.`,
+        );
+      } else {
+        room.turnPlayerId = opponentId;
+      }
     }
 
     emitRoomState(room);
-    safeAck(ack, { ok: true, exactCount, wordLength: room.wordLength });
+    safeAck(ack, {
+      ok: true,
+      exactCount,
+      wordLength: room.wordLength,
+      remainingAttempts: Math.max(0, playerAttemptsLeft),
+      maxAttemptsPerPlayer: room.maxAttemptsPerPlayer,
+    });
   });
 
   socket.on("duel:chat-send", (payload, ack) => {
@@ -621,12 +809,19 @@ io.on("connection", (socket) => {
     }
 
     const { room, player } = resolved;
+    const now = Date.now();
+    if (now - player.lastChatAt < CHAT_COOLDOWN_MS) {
+      safeAck(ack, { ok: false, message: "Message envoye trop vite." });
+      return;
+    }
+
     const text = sanitizeChatMessage(payload?.message);
     if (!text) {
       safeAck(ack, { ok: false, message: "Message vide." });
       return;
     }
 
+    player.lastChatAt = now;
     pushChatMessage(room, {
       id: randomUUID(),
       senderId: player.id,
@@ -634,6 +829,50 @@ io.on("connection", (socket) => {
       text,
       createdAt: new Date().toISOString(),
     });
+    emitRoomState(room);
+    safeAck(ack, { ok: true });
+  });
+
+  socket.on("duel:request-rematch", (_payload, ack) => {
+    const resolved = getRoomAndPlayerFromSocket(socket);
+    if (!resolved) {
+      safeAck(ack, { ok: false, message: "Tu n'es dans aucune salle." });
+      return;
+    }
+
+    const { room, player } = resolved;
+    if (room.phase !== "finished") {
+      safeAck(ack, { ok: false, message: "La revanche est disponible uniquement en fin de partie." });
+      return;
+    }
+
+    room.rematchRequestsByPlayer[player.id] = true;
+
+    const allPlayersReadyForRematch =
+      room.playerOrder.length === 2 &&
+      room.playerOrder.every((playerId) => room.rematchRequestsByPlayer[playerId]);
+
+    if (allPlayersReadyForRematch) {
+      resetRoomForChoosing(room);
+      pushSystemMessage(room, "Revanche acceptee: nouvelle manche, choisissez vos mots secrets.");
+      emitRoomState(room);
+      safeAck(ack, { ok: true, started: true });
+      return;
+    }
+
+    emitRoomState(room);
+    safeAck(ack, { ok: true, started: false });
+  });
+
+  socket.on("duel:cancel-rematch", (_payload, ack) => {
+    const resolved = getRoomAndPlayerFromSocket(socket);
+    if (!resolved) {
+      safeAck(ack, { ok: false, message: "Tu n'es dans aucune salle." });
+      return;
+    }
+
+    const { room, player } = resolved;
+    room.rematchRequestsByPlayer[player.id] = false;
     emitRoomState(room);
     safeAck(ack, { ok: true });
   });

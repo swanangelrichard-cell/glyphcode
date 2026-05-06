@@ -1,4 +1,4 @@
-import { CSSProperties, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, FormEvent, useEffect, useMemo, useState } from "react";
 import {
   SECRET_WORDS_BY_LENGTH,
   SupportedWordLength,
@@ -73,7 +73,6 @@ const pickAiGuess = (candidates: readonly string[], previousGuesses: readonly Du
 };
 
 function AIDuel() {
-  const playerBoardInputRef = useRef<HTMLInputElement | null>(null);
   const [selectedWordLength, setSelectedWordLength] = useState<SupportedWordLength>(5);
   const [phase, setPhase] = useState<DuelPhase>("setup");
   const [turn, setTurn] = useState<DuelTurn>("player");
@@ -142,18 +141,6 @@ function AIDuel() {
 
     return () => window.clearTimeout(timeoutId);
   }, [aiCandidates, aiGuesses, phase, playerSecret, selectedWordLength, turn]);
-
-  useEffect(() => {
-    if (phase !== "playing" || turn !== "player") {
-      return;
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      playerBoardInputRef.current?.focus();
-    }, 20);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [phase, turn, playerGuesses.length, selectedWordLength]);
 
   const startDuel = () => {
     const sanitizedSecret = sanitizeWord(playerSecretInput, selectedWordLength);
@@ -235,30 +222,6 @@ function AIDuel() {
     setTurn("ai");
     setStatusMessage(`Ton essai: ${exactCount}/${selectedWordLength}. L'IA reflechit...`);
     setStatusTone("info");
-  };
-
-  const onPlayerInputKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
-    if (phase !== "playing" || turn !== "player" || event.altKey || event.ctrlKey || event.metaKey) {
-      return;
-    }
-
-    if (event.key === "Enter") {
-      event.preventDefault();
-      submitPlayerGuess();
-      return;
-    }
-
-    if (event.key === "Escape") {
-      event.preventDefault();
-      setPlayerGuessInput("");
-      return;
-    }
-  };
-
-  const focusPlayerBoardInput = () => {
-    if (phase === "playing" && turn === "player") {
-      playerBoardInputRef.current?.focus();
-    }
   };
 
   const onStartDuelSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -363,29 +326,7 @@ function AIDuel() {
 
         <section className="duel-card">
           <h2>Mes essais</h2>
-          <div
-            className="duel-grid-board"
-            onMouseDown={focusPlayerBoardInput}
-            onTouchStart={focusPlayerBoardInput}
-          >
-            <input
-              ref={playerBoardInputRef}
-              className="grid-capture-input"
-              type="text"
-              inputMode="text"
-              autoCapitalize="characters"
-              autoCorrect="off"
-              autoComplete="off"
-              spellCheck={false}
-              maxLength={selectedWordLength}
-              value={playerGuessInput}
-              onChange={(event) =>
-                setPlayerGuessInput(sanitizeWord(event.target.value, selectedWordLength))
-              }
-              onKeyDown={onPlayerInputKeyDown}
-              disabled={phase !== "playing" || turn !== "player"}
-              aria-label="Saisie de mes essais"
-            />
+          <div className="duel-grid-board">
             <div className="grid">
               {playerGuesses.map((guess, rowIndex) => (
                 <div className="row row--past" key={`${guess.guess}-${rowIndex}`}>
@@ -404,15 +345,16 @@ function AIDuel() {
 
               {phase !== "setup" && (
                 <div className="row row--current">
-                  <div className="row__tiles" style={rowTilesStyle}>
-                    {toTiles(playerGuessInput, selectedWordLength).map((letter, index) => (
-                      <div
-                        className={`tile ${letter ? "tile--typing" : "tile--idle"}`}
-                        key={`current-${index}`}
-                      >
-                        {letter}
-                      </div>
-                    ))}
+                  <div className="row__tiles row__tiles--input" style={rowTilesStyle}>
+                    <WordGridInput
+                      value={playerGuessInput}
+                      onChange={setPlayerGuessInput}
+                      length={selectedWordLength}
+                      onSubmit={submitPlayerGuess}
+                      disabled={phase !== "playing" || turn !== "player"}
+                      autoFocus={phase === "playing" && turn === "player"}
+                      placeholder={`Essai de ${selectedWordLength} lettres`}
+                    />
                   </div>
                   <span className="row__score">en cours</span>
                 </div>

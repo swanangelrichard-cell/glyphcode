@@ -32,12 +32,15 @@ type DuelChatMessage = {
 type DuelState = {
   code: string;
   wordLength: SupportedWordLength;
+  maxAttemptsPerPlayer: number;
+  hasPassword: boolean;
   phase: DuelPhase;
   winnerId: string | null;
   turnPlayerId: string | null;
   playerOrder: string[];
   players: Record<string, DuelPlayer>;
   guessesByPlayer: Record<string, DuelGuess[]>;
+  rematchRequestsByPlayer: Record<string, boolean>;
   chat: DuelChatMessage[];
   reconnectGraceMs?: number;
 };
@@ -49,8 +52,12 @@ type AckResponse =
       playerId?: string;
       playerToken?: string;
       wordLength?: SupportedWordLength;
+      maxAttemptsPerPlayer?: number;
+      hasPassword?: boolean;
       exactCount?: number;
+      remainingAttempts?: number;
       resumed?: boolean;
+      started?: boolean;
       message?: string;
     }
   | { ok: false; message: string };
@@ -66,6 +73,8 @@ const DUEL_SERVER_URL =
 const DUEL_SESSION_STORAGE_KEY = "mememot_duel_session_v1";
 const DUEL_NAME_STORAGE_KEY = "mememot_duel_name_v1";
 const QUICK_CHAT_MESSAGES = ["Bonne chance", "Bien joue", "A toi", "GG"];
+const MIN_MAX_ATTEMPTS_PER_PLAYER = 4;
+const MAX_MAX_ATTEMPTS_PER_PLAYER = 12;
 
 const sanitizeWord = (rawWord: string, maxLength: number) =>
   rawWord
@@ -83,6 +92,12 @@ const sanitizeRoomCode = (value: string) =>
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, "")
     .slice(0, 6);
+
+const sanitizeRoomPassword = (value: string) =>
+  value
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 12);
 
 const createDefaultName = () => `Joueur-${Math.floor(100 + Math.random() * 900)}`;
 
@@ -143,7 +158,11 @@ function OnlineDuel() {
   const [connected, setConnected] = useState(false);
   const [displayName, setDisplayName] = useState(() => loadStoredName() ?? createDefaultName());
   const [selectedWordLength, setSelectedWordLength] = useState<SupportedWordLength>(5);
+  const [selectedMaxAttempts, setSelectedMaxAttempts] = useState(8);
+  const [useRoomPassword, setUseRoomPassword] = useState(false);
+  const [createRoomPassword, setCreateRoomPassword] = useState("");
   const [roomCodeInput, setRoomCodeInput] = useState("");
+  const [joinRoomPassword, setJoinRoomPassword] = useState("");
   const [myPlayerId, setMyPlayerId] = useState<string | null>(null);
   const [duelState, setDuelState] = useState<DuelState | null>(null);
   const [secretWordInput, setSecretWordInput] = useState("");
@@ -155,6 +174,12 @@ function OnlineDuel() {
   const [statusTone, setStatusTone] = useState<"info" | "warn" | "success">("info");
   const chatLogRef = useRef<HTMLDivElement | null>(null);
   const myGuessInputRef = useRef<HTMLInputElement | null>(null);
+
+  const pulseHaptic = (duration = 20) => {
+    if (typeof navigator !== "undefined" && typeof navigator.vibrate === "function") {
+      navigator.vibrate(duration);
+    }
+  };
 
   useEffect(() => {
     const trimmed = displayName.trim();
@@ -224,6 +249,7 @@ function OnlineDuel() {
       setDuelState(nextState);
       setRoomCodeInput(nextState.code);
       setSelectedWordLength(nextState.wordLength);
+      setSelectedMaxAttempts(nextState.maxAttemptsPerPlayer);
     });
 
     nextSocket.on("duel:error", (payload: { message?: string }) => {
@@ -292,6 +318,16 @@ function OnlineDuel() {
   const reconnectSeconds = duelState?.reconnectGraceMs
     ? Math.round(duelState.reconnectGraceMs / 1000)
     : 90;
+  const maxAttemptsPerPlayer = duelState?.maxAttemptsPerPlayer ?? selectedMaxAttempts;
+  const myRemainingAttempts = Math.max(0, maxAttemptsPerPlayer - myGuesses.length);
+  const myRematchRequested =
+    Boolean(myPlayerId && duelState?.rematchRequestsByPlayer?.[myPlayerId]);
+  const opponentRematchRequested = Boolean(
+    myPlayerId &&
+      duelState?.playerOrder
+        ?.filter((id) => id !== myPlayerId)
+        .some((id) => duelState.rematchRequestsByPlayer?.[id]),
+  );
   const rowTilesStyle = {
     ["--letters" as string]: duelState?.wordLength ?? selectedWordLength,
   } as CSSProperties;
@@ -313,9 +349,21 @@ function OnlineDuel() {
       return;
     }
 
+    const roomPassword = useRoomPassword ? sanitizeRoomPassword(createRoomPassword) : "";
+    if (useRoomPassword && roomPassword.length < 4) {
+      setStatusMessage("Le mot de passe de la salle doit faire au moins 4 caracteres.");
+      setStatusTone("warn");
+      return;
+    }
+
     socket.emit(
       "duel:create-room",
-      { playerName: displayName, wordLength: selectedWordLength },
+      {
+        playerName: displayName,
+        wordLength: selectedWordLength,
+        maxAttemptsPerPlayer: selectedMaxAttempts,
+        roomPassword,
+      },
       (response: AckResponse) => {
         if (!response?.ok) {
           setStatusMessage(response.message);
@@ -336,8 +384,12 @@ function OnlineDuel() {
         setSecretWordInput("");
         setGuessInput("");
         setChatInput("");
-        setStatusMessage(`Salon cree: ${roomCode}. Partage ce code.`);
+        setJoinRoomPassword("");
+        setStatusMessage(
+          `Salon prive cree: ${roomCode}. ${response.hasPassword ? "Mot de passe actif." : "Partage le code."}`,
+        );
         setStatusTone("success");
+        pulseHaptic(24);
       },
     );
   };
@@ -348,6 +400,7 @@ function OnlineDuel() {
     }
 
     const code = sanitizeRoomCode(roomCodeInput);
+    const roomPassword = sanitizeRoomPassword(joinRoomPassword);
     if (code.length < 4) {
       setStatusMessage("Entre un code de salon valide.");
       setStatusTone("warn");
@@ -356,7 +409,7 @@ function OnlineDuel() {
 
     socket.emit(
       "duel:join-room",
-      { roomCode: code, playerName: displayName },
+      { roomCode: code, playerName: displayName, roomPassword },
       (response: AckResponse) => {
         if (!response?.ok) {
           setStatusMessage(response.message);
@@ -377,8 +430,11 @@ function OnlineDuel() {
         setSecretWordInput("");
         setGuessInput("");
         setChatInput("");
+        setCreateRoomPassword("");
+        setUseRoomPassword(false);
         setStatusMessage(`Connecte au salon ${roomCode}.`);
         setStatusTone("success");
+        pulseHaptic(16);
       },
     );
   };
@@ -410,6 +466,7 @@ function OnlineDuel() {
 
       setStatusMessage("Mot secret enregistre. En attente de l'autre joueur.");
       setStatusTone("success");
+      pulseHaptic(10);
     });
   };
 
@@ -451,11 +508,18 @@ function OnlineDuel() {
 
       setGuessInput("");
       if (typeof response.exactCount === "number") {
-        setStatusMessage(`Essai envoye: ${response.exactCount}/${duelState.wordLength} bien placees.`);
+        const remainingText =
+          typeof response.remainingAttempts === "number"
+            ? ` | Essais restants: ${response.remainingAttempts}/${response.maxAttemptsPerPlayer ?? duelState.maxAttemptsPerPlayer}`
+            : "";
+        setStatusMessage(
+          `Essai envoye: ${response.exactCount}/${duelState.wordLength} bien placees.${remainingText}`,
+        );
       } else {
         setStatusMessage("Essai envoye.");
       }
       setStatusTone("info");
+      pulseHaptic(12);
     });
   };
 
@@ -481,6 +545,46 @@ function OnlineDuel() {
     if (duelState?.phase === "playing" && isMyTurn) {
       myGuessInputRef.current?.focus();
     }
+  };
+
+  const requestRematch = () => {
+    if (!socket || !duelState) {
+      return;
+    }
+
+    socket.emit("duel:request-rematch", {}, (response: AckResponse) => {
+      if (!response?.ok) {
+        setStatusMessage(response.message);
+        setStatusTone("warn");
+        return;
+      }
+
+      if (response.started) {
+        setStatusMessage("Revanche lancee. Choisissez vos mots secrets.");
+        setStatusTone("success");
+        pulseHaptic(30);
+      } else {
+        setStatusMessage("Demande de revanche envoyee. En attente de l'adversaire.");
+        setStatusTone("info");
+      }
+    });
+  };
+
+  const cancelRematch = () => {
+    if (!socket || !duelState) {
+      return;
+    }
+
+    socket.emit("duel:cancel-rematch", {}, (response: AckResponse) => {
+      if (!response?.ok) {
+        setStatusMessage(response.message);
+        setStatusTone("warn");
+        return;
+      }
+
+      setStatusMessage("Demande de revanche annulee.");
+      setStatusTone("info");
+    });
   };
 
   const sendChatMessage = (rawMessage: string) => {
@@ -521,9 +625,28 @@ function OnlineDuel() {
       setSecretWordInput("");
       setGuessInput("");
       setChatInput("");
+      setCreateRoomPassword("");
+      setJoinRoomPassword("");
+      setUseRoomPassword(false);
       setStatusMessage("Tu as quitte le salon.");
       setStatusTone("info");
     });
+  };
+
+  const copyRoomCode = async () => {
+    if (!duelState?.code) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(duelState.code);
+      setStatusMessage(`Code ${duelState.code} copie dans le presse-papiers.`);
+      setStatusTone("success");
+      pulseHaptic(14);
+    } catch {
+      setStatusMessage("Impossible de copier le code automatiquement.");
+      setStatusTone("warn");
+    }
   };
 
   const winnerName = duelState?.winnerId ? duelState.players[duelState.winnerId]?.name : null;
@@ -565,8 +688,12 @@ function OnlineDuel() {
 
           {!duelState && (
             <>
+              <label className="duel-label" htmlFor="create-word-length">
+                Regles custom (partie privee)
+              </label>
               <div className="duel-actions">
                 <select
+                  id="create-word-length"
                   className="duel-select"
                   value={selectedWordLength}
                   onChange={(event) =>
@@ -577,12 +704,65 @@ function OnlineDuel() {
                   <option value={6}>Mots de 6 lettres</option>
                   <option value={7}>Mots de 7 lettres</option>
                 </select>
+                <select
+                  className="duel-select"
+                  value={selectedMaxAttempts}
+                  onChange={(event) =>
+                    setSelectedMaxAttempts(
+                      Math.max(
+                        MIN_MAX_ATTEMPTS_PER_PLAYER,
+                        Math.min(
+                          MAX_MAX_ATTEMPTS_PER_PLAYER,
+                          Number(event.target.value) || MIN_MAX_ATTEMPTS_PER_PLAYER,
+                        ),
+                      ),
+                    )
+                  }
+                >
+                  {Array.from(
+                    {
+                      length:
+                        MAX_MAX_ATTEMPTS_PER_PLAYER - MIN_MAX_ATTEMPTS_PER_PLAYER + 1,
+                    },
+                    (_, index) => MIN_MAX_ATTEMPTS_PER_PLAYER + index,
+                  ).map((attemptCount) => (
+                    <option key={attemptCount} value={attemptCount}>
+                      {attemptCount} essais max / joueur
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <label className="toggle">
+                <input
+                  type="checkbox"
+                  checked={useRoomPassword}
+                  onChange={(event) => setUseRoomPassword(event.target.checked)}
+                />
+                <span>Activer un mot de passe de salle</span>
+              </label>
+
+              {useRoomPassword && (
+                <input
+                  className="duel-input"
+                  type="text"
+                  placeholder="Mot de passe (4-12 caracteres)"
+                  value={createRoomPassword}
+                  maxLength={12}
+                  onChange={(event) =>
+                    setCreateRoomPassword(sanitizeRoomPassword(event.target.value))
+                  }
+                />
+              )}
+
+              <div className="duel-actions duel-actions--single">
                 <button type="button" className="duel-btn" onClick={createRoom}>
-                  Creer un salon
+                  Creer une partie privee
                 </button>
               </div>
 
-              <div className="duel-actions">
+              <label className="duel-label">Rejoindre une partie privee</label>
+              <div className="duel-actions duel-actions--triple">
                 <input
                   className="duel-input"
                   type="text"
@@ -590,6 +770,16 @@ function OnlineDuel() {
                   value={roomCodeInput}
                   maxLength={6}
                   onChange={(event) => setRoomCodeInput(sanitizeRoomCode(event.target.value))}
+                />
+                <input
+                  className="duel-input"
+                  type="text"
+                  placeholder="Mot de passe (si active)"
+                  value={joinRoomPassword}
+                  maxLength={12}
+                  onChange={(event) =>
+                    setJoinRoomPassword(sanitizeRoomPassword(event.target.value))
+                  }
                 />
                 <button type="button" className="duel-btn duel-btn--secondary" onClick={joinRoom}>
                   Rejoindre
@@ -604,16 +794,23 @@ function OnlineDuel() {
             <section className="duel-card">
               <div className="duel-room-head">
                 <h2>Salle {duelState.code}</h2>
-                <button type="button" className="duel-btn duel-btn--ghost" onClick={leaveRoom}>
-                  Quitter
-                </button>
+                <div className="duel-room-actions">
+                  <button type="button" className="duel-btn duel-btn--ghost" onClick={copyRoomCode}>
+                    Copier code
+                  </button>
+                  <button type="button" className="duel-btn duel-btn--ghost" onClick={leaveRoom}>
+                    Quitter
+                  </button>
+                </div>
               </div>
               <p className="duel-meta">
                 Phase: <strong>{duelState.phase}</strong> | Mot de{" "}
-                <strong>{duelState.wordLength}</strong> lettres
+                <strong>{duelState.wordLength}</strong> lettres | Essais max:{" "}
+                <strong>{duelState.maxAttemptsPerPlayer}</strong> / joueur
               </p>
               <p className="duel-meta">
                 Reconnexion auto: <strong>{reconnectSeconds}s</strong> de delai avant retrait.
+                {duelState.hasPassword ? " | Salle protegee par mot de passe." : ""}
               </p>
 
               <ul className="duel-players">
@@ -625,7 +822,8 @@ function OnlineDuel() {
                     </span>
                     <strong>
                       {player.connected ? "En ligne" : "Hors ligne"} |{" "}
-                      {player.ready ? "Pret" : "Pas pret"} | {player.guessesCount} essai(s)
+                      {player.ready ? "Pret" : "Pas pret"} | {player.guessesCount}/
+                      {duelState.maxAttemptsPerPlayer} essai(s)
                     </strong>
                   </li>
                 ))}
@@ -664,14 +862,53 @@ function OnlineDuel() {
                     Tour de: <strong>{turnPlayerName ?? "-"}</strong>{" "}
                     {isMyTurn ? "(a toi de jouer)" : ""}
                   </p>
-                  <p className="duel-note">Ecris directement dans la grille "Mes essais".</p>
+                  <p className="duel-note">
+                    Ecris directement dans la grille "Mes essais". Tes essais restants:{" "}
+                    <strong>{myRemainingAttempts}</strong> / {duelState.maxAttemptsPerPlayer}
+                  </p>
                 </>
               )}
 
               {duelState.phase === "finished" && (
-                <p className="duel-result">
-                  Partie finie. Gagnant: <strong>{winnerName ?? "Inconnu"}</strong>
-                </p>
+                <div className="duel-finished">
+                  <p className="duel-result">
+                    Partie finie.{" "}
+                    {winnerName ? (
+                      <>
+                        Gagnant: <strong>{winnerName}</strong>
+                      </>
+                    ) : (
+                      <>
+                        Resultat: <strong>Egalite</strong>
+                      </>
+                    )}
+                  </p>
+
+                  <div className="duel-rematch">
+                    <button
+                      type="button"
+                      className="duel-btn"
+                      onClick={requestRematch}
+                      disabled={myRematchRequested}
+                    >
+                      {myRematchRequested ? "Revanche demandee" : "Demander revanche"}
+                    </button>
+                    {myRematchRequested && (
+                      <button
+                        type="button"
+                        className="duel-btn duel-btn--ghost"
+                        onClick={cancelRematch}
+                      >
+                        Annuler
+                      </button>
+                    )}
+                  </div>
+
+                  <p className="duel-note">
+                    Etat revanche: toi {myRematchRequested ? "pret" : "en attente"} | adversaire{" "}
+                    {opponentRematchRequested ? "pret" : "en attente"}
+                  </p>
+                </div>
               )}
             </section>
 
@@ -751,6 +988,26 @@ function OnlineDuel() {
                   </button>
                 )}
               </div>
+
+              {duelState.phase === "playing" && (
+                <div className="duel-mobile-actions">
+                  <button
+                    type="button"
+                    className="duel-btn"
+                    onClick={submitGuessAction}
+                    disabled={!isMyTurn}
+                  >
+                    Valider
+                  </button>
+                  <button
+                    type="button"
+                    className="duel-btn duel-btn--ghost"
+                    onClick={focusGuessInput}
+                  >
+                    Ecrire
+                  </button>
+                </div>
+              )}
             </section>
 
             <section className="duel-card duel-chat">
